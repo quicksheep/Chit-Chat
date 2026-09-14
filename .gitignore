@@ -1,0 +1,14 @@
+build/
+out/
+.vs/
+CMakeFiles/
+CMakeCache.txt
+*.aex
+*.obj
+*.pdb
+*.exp
+*.lib
+*.ilk
+*.rr
+*.rrc
+*.user

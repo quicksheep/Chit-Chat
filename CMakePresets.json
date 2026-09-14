@@ -1,0 +1,23 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "windows-x64",
+      "displayName": "Windows x64 (Chit Chat)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "AESDK_ROOT": "C:/SDKs/AfterEffectsSDK_25.6_61_win/ae25.6_61.64bit.AfterEffectsSDK"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "release",
+      "displayName": "Build Chit Chat (Release)",
+      "configurePreset": "windows-x64"
+    }
+  ]
+}
