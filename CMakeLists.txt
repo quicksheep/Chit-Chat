@@ -113,7 +113,7 @@ if(MSVC)
 	target_link_options(ChitChat PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/plugin/ChitChat.def")
 endif()
 
-target_link_libraries(ChitChat PRIVATE d2d1 dwrite windowscodecs ole32)
+target_link_libraries(ChitChat PRIVATE d2d1 dwrite windowscodecs ole32 comdlg32)
 
 set_target_properties(ChitChat PROPERTIES
 	OUTPUT_NAME "ChitChat"

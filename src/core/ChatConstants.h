@@ -32,5 +32,11 @@ inline constexpr float kDefaultOffsetPx = 24.0f;
 inline constexpr float kDefaultMaxWidthPct = 70.0f;
 inline constexpr float kDefaultMarginX = 16.0f;
 inline constexpr float kDefaultMarginY = 16.0f;
+inline constexpr float kDefaultStroke = 0.0f;
+inline constexpr float kMaxStroke = 40.0f;
+inline constexpr float kDefaultLetterSpacing = 0.0f;
+inline constexpr float kDefaultLineHeight = 1.2f;
+inline constexpr int kFontPresetCount = 6;
+inline constexpr int kMaxFontNameBytes = 128;
 
 } // namespace chitchat

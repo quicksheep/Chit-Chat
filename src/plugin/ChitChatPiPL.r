@@ -28,8 +28,8 @@ resource 'PiPL' (16000) {
 
 		AE_PiPL_Version { 2, 0 },
 		AE_Effect_Spec_Version { PF_PLUG_IN_VERSION, PF_PLUG_IN_SUBVERS },
-		/* PF_VERSION(1, 0, 0, PF_Stage_RELEASE, 1) — must match ChitChat.h + GlobalSetup */
-		AE_Effect_Version { 525825 },
+		/* PF_VERSION(1, 0, 0, PF_Stage_RELEASE, 2) — must match ChitChat.h + GlobalSetup */
+		AE_Effect_Version { 525828 },
 		AE_Effect_Info_Flags { 0 },
 		/* Must match GlobalSetup: DEEP_COLOR | NON_PARAM_VARY | WIDE_TIME | SEND_UPDATE_PARAMS_UI */
 		AE_Effect_Global_OutFlags { 100663302 },

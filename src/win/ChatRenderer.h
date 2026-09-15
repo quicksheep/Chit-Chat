@@ -29,6 +29,7 @@ public:
 	const wchar_t* FontFamily(int font_index) const;
 
 	bool Measure(const StyleSettings& style,
+				 Sender sender,
 				 const std::string& utf8_text,
 				 float max_bubble_width,
 				 MeasuredBubble* out);

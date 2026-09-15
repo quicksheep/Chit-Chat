@@ -9,6 +9,11 @@
 #include "../win/TranscriptDialog.h"
 #include "Composite.h"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <commdlg.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -26,6 +31,7 @@ chitchat::ChatRenderer g_renderer;
 
 struct SequenceData {
 	chitchat::ArbBlock messages;
+	char custom_font[chitchat::kMaxFontNameBytes];
 };
 
 struct LockedMessages {
@@ -35,6 +41,7 @@ struct LockedMessages {
 
 struct PreRenderPack {
 	chitchat::ArbBlock messages;
+	char custom_font[chitchat::kMaxFontNameBytes];
 };
 
 static void DeletePreRenderPack(void* p) {
@@ -114,6 +121,97 @@ static bool LoadMessageBlock(PF_InData* in_data, AEGP_SuiteHandler* suites, chit
 	return poked && CopyValidArb(poked, out);
 }
 
+static bool HandleHoldsFont(AEGP_SuiteHandler* suites, PF_Handle h) {
+	if (!suites || !h) {
+		return false;
+	}
+	return suites->HandleSuite1()->host_get_handle_size(h) >= sizeof(SequenceData);
+}
+
+static void FontFromSeqPtr(const void* p, char* out) {
+	if (!out) {
+		return;
+	}
+	out[0] = '\0';
+	if (!p) {
+		return;
+	}
+	const auto* seq = reinterpret_cast<const SequenceData*>(p);
+	if (!chitchat::ValidateArb(seq->messages)) {
+		return;
+	}
+	std::memcpy(out, seq->custom_font, sizeof(seq->custom_font));
+	out[chitchat::kMaxFontNameBytes - 1] = '\0';
+}
+
+static bool LoadCustomFontName(PF_InData* in_data, AEGP_SuiteHandler* suites, char* out) {
+	if (!out) {
+		return false;
+	}
+	out[0] = '\0';
+	if (in_data->sequence_data && suites && HandleHoldsFont(suites, in_data->sequence_data)) {
+		void* p = suites->HandleSuite1()->host_lock_handle(in_data->sequence_data);
+		if (p) {
+			FontFromSeqPtr(p, out);
+			suites->HandleSuite1()->host_unlock_handle(in_data->sequence_data);
+			if (out[0]) {
+				return true;
+			}
+		}
+	}
+	return out[0] != '\0';
+}
+
+static bool EnsureSequenceCapacity(PF_InData* in_data, PF_OutData* out_data, AEGP_SuiteHandler* suites) {
+	if (!in_data->sequence_data || !suites) {
+		return false;
+	}
+	PF_Handle h = in_data->sequence_data;
+	const A_HandleSize have = suites->HandleSuite1()->host_get_handle_size(h);
+	if (have >= sizeof(SequenceData)) {
+		if (out_data) {
+			out_data->sequence_data = h;
+		}
+		return true;
+	}
+	PF_Handle grown = h;
+	if (suites->HandleSuite1()->host_resize_handle(sizeof(SequenceData), &grown) != PF_Err_NONE || !grown) {
+		grown = suites->HandleSuite1()->host_new_handle(sizeof(SequenceData));
+		if (!grown) {
+			return false;
+		}
+		void* dst = suites->HandleSuite1()->host_lock_handle(grown);
+		void* src = suites->HandleSuite1()->host_lock_handle(h);
+		if (!dst || !src) {
+			if (dst) {
+				suites->HandleSuite1()->host_unlock_handle(grown);
+			}
+			if (src) {
+				suites->HandleSuite1()->host_unlock_handle(h);
+			}
+			suites->HandleSuite1()->host_dispose_handle(grown);
+			return false;
+		}
+		std::memset(dst, 0, sizeof(SequenceData));
+		std::memcpy(dst, src, static_cast<std::size_t>((std::min)(have, static_cast<A_HandleSize>(sizeof(chitchat::ArbBlock)))));
+		suites->HandleSuite1()->host_unlock_handle(grown);
+		suites->HandleSuite1()->host_unlock_handle(h);
+	} else {
+		void* p = suites->HandleSuite1()->host_lock_handle(grown);
+		if (p && have < sizeof(SequenceData)) {
+			auto* seq = reinterpret_cast<SequenceData*>(p);
+			seq->custom_font[0] = '\0';
+		}
+		if (p) {
+			suites->HandleSuite1()->host_unlock_handle(grown);
+		}
+	}
+	if (out_data) {
+		out_data->sequence_data = grown;
+	}
+	return true;
+}
+
 static LockedMessages LockMessages(PF_InData* in_data, AEGP_SuiteHandler* suites) {
 	LockedMessages locked;
 	locked.handle = in_data->sequence_data;
@@ -147,6 +245,7 @@ static PF_Err SequenceSetup(PF_InData* in_data, PF_OutData* out_data) {
 		return PF_Err_OUT_OF_MEMORY;
 	}
 	chitchat::DefaultArb(&seq->messages);
+	seq->custom_font[0] = '\0';
 	suites.HandleSuite1()->host_unlock_handle(h);
 	out_data->sequence_data = h;
 	return PF_Err_NONE;
@@ -167,11 +266,7 @@ static PF_Err SequenceResetup(PF_InData* in_data, PF_OutData* out_data) {
 		return SequenceSetup(in_data, out_data);
 	}
 	AEGP_SuiteHandler suites(in_data->pica_basicP);
-	auto* seq = reinterpret_cast<SequenceData*>(suites.HandleSuite1()->host_lock_handle(out_data->sequence_data));
-	// Never DefaultArb here: a validate miss must not wipe user transcripts.
-	if (seq) {
-		suites.HandleSuite1()->host_unlock_handle(out_data->sequence_data);
-	}
+	EnsureSequenceCapacity(in_data, out_data, &suites);
 	return PF_Err_NONE;
 }
 
@@ -180,6 +275,7 @@ static PF_Err GetFlattenedSequenceData(PF_InData* in_data, PF_OutData* out_data)
 	if (!in_data->sequence_data) {
 		return PF_Err_INTERNAL_STRUCT_DAMAGED;
 	}
+	const A_HandleSize have = suites.HandleSuite1()->host_get_handle_size(in_data->sequence_data);
 	auto* src = reinterpret_cast<SequenceData*>(suites.HandleSuite1()->host_lock_handle(in_data->sequence_data));
 	if (!src) {
 		return PF_Err_INTERNAL_STRUCT_DAMAGED;
@@ -195,7 +291,11 @@ static PF_Err GetFlattenedSequenceData(PF_InData* in_data, PF_OutData* out_data)
 		suites.HandleSuite1()->host_unlock_handle(in_data->sequence_data);
 		return PF_Err_OUT_OF_MEMORY;
 	}
-	*dst = *src;
+	std::memset(dst, 0, sizeof(*dst));
+	const A_HandleSize copy_n = (std::min)(have, static_cast<A_HandleSize>(sizeof(SequenceData)));
+	if (copy_n > 0) {
+		std::memcpy(dst, src, static_cast<std::size_t>(copy_n));
+	}
 	suites.HandleSuite1()->host_unlock_handle(h);
 	suites.HandleSuite1()->host_unlock_handle(in_data->sequence_data);
 	out_data->sequence_data = h;
@@ -262,9 +362,14 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
 						 PF_Precision_HUNDREDTHS, 0, 0, CHITCHAT_DISK_RADIUS);
 
 	AEFX_CLR_STRUCT(def);
-	PF_ADD_FLOAT_SLIDERX("Padding",
+	PF_ADD_FLOAT_SLIDERX("Padding H",
 						 0, 80, 0, 40, chitchat::kDefaultPadding,
-						 PF_Precision_HUNDREDTHS, 0, 0, CHITCHAT_DISK_PADDING);
+						 PF_Precision_HUNDREDTHS, 0, 0, CHITCHAT_DISK_PADDING_X);
+
+	AEFX_CLR_STRUCT(def);
+	PF_ADD_FLOAT_SLIDERX("Padding V",
+						 0, 80, 0, 40, chitchat::kDefaultPadding,
+						 PF_Precision_HUNDREDTHS, 0, 0, CHITCHAT_DISK_PADDING_Y);
 
 	AEFX_CLR_STRUCT(def);
 	PF_ADD_FLOAT_SLIDERX("Bubble Spacing",
@@ -287,7 +392,10 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
 						 PF_Precision_HUNDREDTHS, 0, 0, CHITCHAT_DISK_MARGINY);
 
 	AEFX_CLR_STRUCT(def);
-	PF_ADD_POPUPX("Font", 6, 1, "Segoe UI|Arial|Calibri|Roboto|Georgia|Courier New", 0, CHITCHAT_DISK_FONT);
+	PF_ADD_POPUPX("Font", 7, 1, "Segoe UI|Arial|Calibri|Roboto|Georgia|Courier New|Custom", PF_ParamFlag_SUPERVISE, CHITCHAT_DISK_FONT);
+
+	AEFX_CLR_STRUCT(def);
+	PF_ADD_BUTTON("Custom Font", "Choose Font...", 0, PF_ParamFlag_SUPERVISE, CHITCHAT_DISK_CHOOSE_FONT);
 
 	AEFX_CLR_STRUCT(def);
 	PF_ADD_FLOAT_SLIDERX("Font Size",
@@ -295,23 +403,124 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
 						 PF_Precision_HUNDREDTHS, 0, 0, CHITCHAT_DISK_FONTSIZE);
 
 	AEFX_CLR_STRUCT(def);
+	PF_ADD_FLOAT_SLIDERX("Letter Spacing",
+						 -20, 40, -10, 20, chitchat::kDefaultLetterSpacing,
+						 PF_Precision_HUNDREDTHS, 0, 0, CHITCHAT_DISK_LETTER_SPACING);
+
+	AEFX_CLR_STRUCT(def);
+	PF_ADD_FLOAT_SLIDERX("Line Height",
+						 0.5, 3, 0.8, 2, chitchat::kDefaultLineHeight,
+						 PF_Precision_HUNDREDTHS, 0, 0, CHITCHAT_DISK_LINE_HEIGHT);
+
+	AEFX_CLR_STRUCT(def);
 	PF_ADD_CHECKBOX("Bold", "Bold", FALSE, 0, CHITCHAT_DISK_BOLD);
 
 	AEFX_CLR_STRUCT(def);
-	PF_ADD_COLOR("You Bubble", 0, 122, 255, CHITCHAT_DISK_YOU_BUBBLE);
+	PF_ADD_COLOR("You Bubble Top", 0, 122, 255, CHITCHAT_DISK_YOU_BUBBLE_TOP);
+	AEFX_CLR_STRUCT(def);
+	PF_ADD_COLOR("You Bubble Bottom", 0, 122, 255, CHITCHAT_DISK_YOU_BUBBLE_BOTTOM);
 	AEFX_CLR_STRUCT(def);
 	PF_ADD_COLOR("You Text", 255, 255, 255, CHITCHAT_DISK_YOU_TEXT);
 	AEFX_CLR_STRUCT(def);
-	PF_ADD_COLOR("Them Bubble", 229, 229, 234, CHITCHAT_DISK_THEM_BUBBLE);
+	PF_ADD_FLOAT_SLIDERX("You Stroke Thickness",
+						 0, chitchat::kMaxStroke, 0, chitchat::kMaxStroke, chitchat::kDefaultStroke,
+						 PF_Precision_HUNDREDTHS, 0, 0, CHITCHAT_DISK_YOU_STROKE);
+	AEFX_CLR_STRUCT(def);
+	PF_ADD_COLOR("You Stroke Color", 0, 0, 0, CHITCHAT_DISK_YOU_STROKE_COLOR);
+	AEFX_CLR_STRUCT(def);
+	PF_ADD_COLOR("Them Bubble Top", 229, 229, 234, CHITCHAT_DISK_THEM_BUBBLE_TOP);
+	AEFX_CLR_STRUCT(def);
+	PF_ADD_COLOR("Them Bubble Bottom", 229, 229, 234, CHITCHAT_DISK_THEM_BUBBLE_BOTTOM);
 	AEFX_CLR_STRUCT(def);
 	PF_ADD_COLOR("Them Text", 0, 0, 0, CHITCHAT_DISK_THEM_TEXT);
+	AEFX_CLR_STRUCT(def);
+	PF_ADD_FLOAT_SLIDERX("Them Stroke Thickness",
+						 0, chitchat::kMaxStroke, 0, chitchat::kMaxStroke, chitchat::kDefaultStroke,
+						 PF_Precision_HUNDREDTHS, 0, 0, CHITCHAT_DISK_THEM_STROKE);
+	AEFX_CLR_STRUCT(def);
+	PF_ADD_COLOR("Them Stroke Color", 0, 0, 0, CHITCHAT_DISK_THEM_STROKE_COLOR);
 
 	out_data->num_params = CHITCHAT_NUM_PARAMS;
 	return err;
 }
 
-static PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* /*params*/[], PF_LayerDef* /*output*/, const PF_UserChangedParamExtra* extra) {
-	if (!extra || extra->param_index != CHITCHAT_EDIT) {
+static bool StoreCustomFontName(PF_InData* in_data, PF_OutData* out_data, const wchar_t* face) {
+	if (!face || !face[0] || !in_data->sequence_data) {
+		return false;
+	}
+	AEGP_SuiteHandler suites(in_data->pica_basicP);
+	if (!EnsureSequenceCapacity(in_data, out_data, &suites)) {
+		return false;
+	}
+	PF_Handle h = out_data->sequence_data ? out_data->sequence_data : in_data->sequence_data;
+	if (!HandleHoldsFont(&suites, h)) {
+		return false;
+	}
+	auto* seq = reinterpret_cast<SequenceData*>(suites.HandleSuite1()->host_lock_handle(h));
+	if (!seq) {
+		return false;
+	}
+	char utf8[chitchat::kMaxFontNameBytes];
+	utf8[0] = '\0';
+	const int n = WideCharToMultiByte(CP_UTF8, 0, face, -1, utf8, chitchat::kMaxFontNameBytes, nullptr, nullptr);
+	if (n <= 1) {
+		suites.HandleSuite1()->host_unlock_handle(in_data->sequence_data);
+		return false;
+	}
+	utf8[chitchat::kMaxFontNameBytes - 1] = '\0';
+	std::memcpy(seq->custom_font, utf8, sizeof(seq->custom_font));
+	seq->custom_font[chitchat::kMaxFontNameBytes - 1] = '\0';
+	suites.HandleSuite1()->host_unlock_handle(h);
+	out_data->sequence_data = h;
+	out_data->out_flags |= PF_OutFlag_FORCE_RERENDER | PF_OutFlag_REFRESH_UI;
+	return true;
+}
+
+static bool PickCustomFont(PF_InData* in_data, PF_OutData* out_data) {
+	LOGFONTW lf{};
+	lf.lfHeight = -18;
+	lf.lfWeight = FW_NORMAL;
+	lf.lfCharSet = DEFAULT_CHARSET;
+	lf.lfOutPrecision = OUT_TT_PRECIS;
+	lf.lfClipPrecision = CLIP_DEFAULT_PRECIS;
+	lf.lfQuality = DEFAULT_QUALITY;
+	lf.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
+	char existing[chitchat::kMaxFontNameBytes] = {};
+	AEGP_SuiteHandler suites(in_data->pica_basicP);
+	LoadCustomFontName(in_data, &suites, existing);
+	if (existing[0]) {
+		MultiByteToWideChar(CP_UTF8, 0, existing, -1, lf.lfFaceName, LF_FACESIZE);
+		lf.lfFaceName[LF_FACESIZE - 1] = L'\0';
+	} else {
+		wcsncpy_s(lf.lfFaceName, L"Segoe UI", _TRUNCATE);
+	}
+
+	CHOOSEFONTW cf{};
+	cf.lStructSize = sizeof(cf);
+	cf.hwndOwner = nullptr;
+	cf.lpLogFont = &lf;
+	cf.Flags = CF_TTONLY | CF_INITTOLOGFONTSTRUCT | CF_NOSCRIPTSEL | CF_NOVERTFONTS;
+	if (!ChooseFontW(&cf) || lf.lfFaceName[0] == L'\0') {
+		return false;
+	}
+	return StoreCustomFontName(in_data, out_data, lf.lfFaceName);
+}
+
+static PF_Err UserChangedParam(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], PF_LayerDef* /*output*/, const PF_UserChangedParamExtra* extra) {
+	(void)params;
+	if (!extra) {
+		return PF_Err_NONE;
+	}
+
+	if (extra->param_index == CHITCHAT_CHOOSE_FONT) {
+		PickCustomFont(in_data, out_data);
+		return PF_Err_NONE;
+	}
+	if (extra->param_index == CHITCHAT_FONT) {
+		out_data->out_flags |= PF_OutFlag_FORCE_RERENDER;
+		return PF_Err_NONE;
+	}
+	if (extra->param_index != CHITCHAT_EDIT) {
 		return PF_Err_NONE;
 	}
 
@@ -426,66 +635,83 @@ static float Chan8(A_u_char c) {
 	return c / 255.0f;
 }
 
-static PF_Err RenderChat(PF_InData* in_data, PF_EffectWorld* input, PF_EffectWorld* output, const chitchat::ArbBlock* pre_messages) {
+static PF_Err RenderChat(PF_InData* in_data, PF_EffectWorld* input, PF_EffectWorld* output, const PreRenderPack* pack) {
 	PF_Err err = PF_Err_NONE;
-	AEGP_SuiteHandler suites(in_data->pica_basicP);
-
-	if (input && output) {
-		ERR(suites.WorldTransformSuite1()->copy(in_data->effect_ref, input, output, nullptr, nullptr));
+	(void)input;
+	if (output) {
+		ERR(chitchat::ClearWorld(in_data, output));
 	}
 	if (err) {
 		return err;
 	}
 
-	PF_ParamDef p_fade, p_off, p_rad, p_pad, p_spc, p_maxw, p_mx, p_my, p_font, p_fs, p_bold;
-	PF_ParamDef p_yb, p_yt, p_tb, p_tt, p_appear;
+	PF_ParamDef p_fade, p_off, p_rad, p_padx, p_pady, p_spc, p_maxw, p_mx, p_my, p_font, p_fs, p_track, p_lh, p_bold;
+	PF_ParamDef p_ybt, p_ybb, p_yt, p_ys, p_ysc, p_tbt, p_tbb, p_tt, p_ts, p_tsc, p_appear;
 	AEFX_CLR_STRUCT(p_fade);
 	AEFX_CLR_STRUCT(p_off);
 	AEFX_CLR_STRUCT(p_rad);
-	AEFX_CLR_STRUCT(p_pad);
+	AEFX_CLR_STRUCT(p_padx);
+	AEFX_CLR_STRUCT(p_pady);
 	AEFX_CLR_STRUCT(p_spc);
 	AEFX_CLR_STRUCT(p_maxw);
 	AEFX_CLR_STRUCT(p_mx);
 	AEFX_CLR_STRUCT(p_my);
 	AEFX_CLR_STRUCT(p_font);
 	AEFX_CLR_STRUCT(p_fs);
+	AEFX_CLR_STRUCT(p_track);
+	AEFX_CLR_STRUCT(p_lh);
 	AEFX_CLR_STRUCT(p_bold);
-	AEFX_CLR_STRUCT(p_yb);
+	AEFX_CLR_STRUCT(p_ybt);
+	AEFX_CLR_STRUCT(p_ybb);
 	AEFX_CLR_STRUCT(p_yt);
-	AEFX_CLR_STRUCT(p_tb);
+	AEFX_CLR_STRUCT(p_ys);
+	AEFX_CLR_STRUCT(p_ysc);
+	AEFX_CLR_STRUCT(p_tbt);
+	AEFX_CLR_STRUCT(p_tbb);
 	AEFX_CLR_STRUCT(p_tt);
+	AEFX_CLR_STRUCT(p_ts);
+	AEFX_CLR_STRUCT(p_tsc);
 	AEFX_CLR_STRUCT(p_appear);
 
 	const A_long t = in_data->current_time;
 	const A_long ts = in_data->time_step;
 	const A_long sc = in_data->time_scale;
 
-	PF_ParamDef* checked[17] = {};
+	PF_ParamDef* checked[32] = {};
 	int n_checked = 0;
 	auto checkout = [&](PF_ParamDef* def, A_long param_index) {
 		if (err) {
 			return;
 		}
 		err = PF_CHECKOUT_PARAM(in_data, param_index, t, ts, sc, def);
-		if (!err && n_checked < 17) {
+		if (!err && n_checked < 32) {
 			checked[n_checked++] = def;
 		}
 	};
 	checkout(&p_fade, CHITCHAT_FADE);
 	checkout(&p_off, CHITCHAT_OFFSET);
 	checkout(&p_rad, CHITCHAT_RADIUS);
-	checkout(&p_pad, CHITCHAT_PADDING);
+	checkout(&p_padx, CHITCHAT_PADDING_X);
+	checkout(&p_pady, CHITCHAT_PADDING_Y);
 	checkout(&p_spc, CHITCHAT_SPACING);
 	checkout(&p_maxw, CHITCHAT_MAXW);
 	checkout(&p_mx, CHITCHAT_MARGINX);
 	checkout(&p_my, CHITCHAT_MARGINY);
 	checkout(&p_font, CHITCHAT_FONT);
 	checkout(&p_fs, CHITCHAT_FONTSIZE);
+	checkout(&p_track, CHITCHAT_LETTER_SPACING);
+	checkout(&p_lh, CHITCHAT_LINE_HEIGHT);
 	checkout(&p_bold, CHITCHAT_BOLD);
-	checkout(&p_yb, CHITCHAT_YOU_BUBBLE);
+	checkout(&p_ybt, CHITCHAT_YOU_BUBBLE_TOP);
+	checkout(&p_ybb, CHITCHAT_YOU_BUBBLE_BOTTOM);
 	checkout(&p_yt, CHITCHAT_YOU_TEXT);
-	checkout(&p_tb, CHITCHAT_THEM_BUBBLE);
+	checkout(&p_ys, CHITCHAT_YOU_STROKE);
+	checkout(&p_ysc, CHITCHAT_YOU_STROKE_COLOR);
+	checkout(&p_tbt, CHITCHAT_THEM_BUBBLE_TOP);
+	checkout(&p_tbb, CHITCHAT_THEM_BUBBLE_BOTTOM);
 	checkout(&p_tt, CHITCHAT_THEM_TEXT);
+	checkout(&p_ts, CHITCHAT_THEM_STROKE);
+	checkout(&p_tsc, CHITCHAT_THEM_STROKE_COLOR);
 	checkout(&p_appear, CHITCHAT_APPEAR);
 	if (err) {
 		for (int i = 0; i < n_checked; ++i) {
@@ -498,6 +724,7 @@ static PF_Err RenderChat(PF_InData* in_data, PF_EffectWorld* input, PF_EffectWor
 	std::vector<chitchat::Message> all;
 	chitchat::ArbBlock block;
 	chitchat::ClearArb(&block);
+	const chitchat::ArbBlock* pre_messages = pack ? &pack->messages : nullptr;
 	bool have = pre_messages && pre_messages->count > 0 && CopyValidArb(pre_messages, &block);
 	if (!have) {
 		AEGP_SuiteHandler hs(in_data->pica_basicP);
@@ -515,42 +742,78 @@ static PF_Err RenderChat(PF_InData* in_data, PF_EffectWorld* input, PF_EffectWor
 	style.fade_in_sec = static_cast<float>(p_fade.u.fs_d.value);
 	style.appear_offset_px = static_cast<float>(p_off.u.fs_d.value) * ds;
 	style.corner_radius = static_cast<float>(p_rad.u.fs_d.value) * ds;
-	style.padding = static_cast<float>(p_pad.u.fs_d.value) * ds;
+	style.padding_x = static_cast<float>(p_padx.u.fs_d.value) * ds;
+	style.padding_y = static_cast<float>(p_pady.u.fs_d.value) * ds;
 	style.spacing = static_cast<float>(p_spc.u.fs_d.value) * ds;
 	style.max_width_pct = static_cast<float>(p_maxw.u.fs_d.value);
 	style.margin_x = static_cast<float>(p_mx.u.fs_d.value) * ds;
 	style.margin_y = static_cast<float>(p_my.u.fs_d.value) * ds;
 	style.font_index = (std::max)(0, static_cast<int>(p_font.u.pd.value) - 1);
 	style.font_size = static_cast<float>(p_fs.u.fs_d.value) * ds;
+	style.letter_spacing = static_cast<float>(p_track.u.fs_d.value) * ds;
+	style.line_height = static_cast<float>(p_lh.u.fs_d.value);
+	if (style.line_height < 0.5f) {
+		style.line_height = 0.5f;
+	}
 	style.bold = p_bold.u.bd.value != 0;
-	style.you_bubble_r = Chan8(p_yb.u.cd.value.red);
-	style.you_bubble_g = Chan8(p_yb.u.cd.value.green);
-	style.you_bubble_b = Chan8(p_yb.u.cd.value.blue);
+	if (pack && pack->custom_font[0]) {
+		std::memcpy(style.custom_font, pack->custom_font, sizeof(style.custom_font));
+		style.custom_font[chitchat::kMaxFontNameBytes - 1] = '\0';
+	} else {
+		AEGP_SuiteHandler font_suites(in_data->pica_basicP);
+		LoadCustomFontName(in_data, &font_suites, style.custom_font);
+	}
+	style.you_bubble_top_r = Chan8(p_ybt.u.cd.value.red);
+	style.you_bubble_top_g = Chan8(p_ybt.u.cd.value.green);
+	style.you_bubble_top_b = Chan8(p_ybt.u.cd.value.blue);
+	style.you_bubble_bot_r = Chan8(p_ybb.u.cd.value.red);
+	style.you_bubble_bot_g = Chan8(p_ybb.u.cd.value.green);
+	style.you_bubble_bot_b = Chan8(p_ybb.u.cd.value.blue);
 	style.you_text_r = Chan8(p_yt.u.cd.value.red);
 	style.you_text_g = Chan8(p_yt.u.cd.value.green);
 	style.you_text_b = Chan8(p_yt.u.cd.value.blue);
-	style.them_bubble_r = Chan8(p_tb.u.cd.value.red);
-	style.them_bubble_g = Chan8(p_tb.u.cd.value.green);
-	style.them_bubble_b = Chan8(p_tb.u.cd.value.blue);
+	style.you_stroke = static_cast<float>(p_ys.u.fs_d.value) * ds;
+	style.you_stroke_r = Chan8(p_ysc.u.cd.value.red);
+	style.you_stroke_g = Chan8(p_ysc.u.cd.value.green);
+	style.you_stroke_b = Chan8(p_ysc.u.cd.value.blue);
+	style.them_bubble_top_r = Chan8(p_tbt.u.cd.value.red);
+	style.them_bubble_top_g = Chan8(p_tbt.u.cd.value.green);
+	style.them_bubble_top_b = Chan8(p_tbt.u.cd.value.blue);
+	style.them_bubble_bot_r = Chan8(p_tbb.u.cd.value.red);
+	style.them_bubble_bot_g = Chan8(p_tbb.u.cd.value.green);
+	style.them_bubble_bot_b = Chan8(p_tbb.u.cd.value.blue);
 	style.them_text_r = Chan8(p_tt.u.cd.value.red);
 	style.them_text_g = Chan8(p_tt.u.cd.value.green);
 	style.them_text_b = Chan8(p_tt.u.cd.value.blue);
+	style.them_stroke = static_cast<float>(p_ts.u.fs_d.value) * ds;
+	style.them_stroke_r = Chan8(p_tsc.u.cd.value.red);
+	style.them_stroke_g = Chan8(p_tsc.u.cd.value.green);
+	style.them_stroke_b = Chan8(p_tsc.u.cd.value.blue);
 
 	PF_CHECKIN_PARAM(in_data, &p_fade);
 	PF_CHECKIN_PARAM(in_data, &p_off);
 	PF_CHECKIN_PARAM(in_data, &p_rad);
-	PF_CHECKIN_PARAM(in_data, &p_pad);
+	PF_CHECKIN_PARAM(in_data, &p_padx);
+	PF_CHECKIN_PARAM(in_data, &p_pady);
 	PF_CHECKIN_PARAM(in_data, &p_spc);
 	PF_CHECKIN_PARAM(in_data, &p_maxw);
 	PF_CHECKIN_PARAM(in_data, &p_mx);
 	PF_CHECKIN_PARAM(in_data, &p_my);
 	PF_CHECKIN_PARAM(in_data, &p_font);
 	PF_CHECKIN_PARAM(in_data, &p_fs);
+	PF_CHECKIN_PARAM(in_data, &p_track);
+	PF_CHECKIN_PARAM(in_data, &p_lh);
 	PF_CHECKIN_PARAM(in_data, &p_bold);
-	PF_CHECKIN_PARAM(in_data, &p_yb);
+	PF_CHECKIN_PARAM(in_data, &p_ybt);
+	PF_CHECKIN_PARAM(in_data, &p_ybb);
 	PF_CHECKIN_PARAM(in_data, &p_yt);
-	PF_CHECKIN_PARAM(in_data, &p_tb);
+	PF_CHECKIN_PARAM(in_data, &p_ys);
+	PF_CHECKIN_PARAM(in_data, &p_ysc);
+	PF_CHECKIN_PARAM(in_data, &p_tbt);
+	PF_CHECKIN_PARAM(in_data, &p_tbb);
 	PF_CHECKIN_PARAM(in_data, &p_tt);
+	PF_CHECKIN_PARAM(in_data, &p_ts);
+	PF_CHECKIN_PARAM(in_data, &p_tsc);
 	PF_CHECKIN_PARAM(in_data, &p_appear);
 
 	if (appear_id <= 0 || all.empty() || !output) {
@@ -597,9 +860,10 @@ static PF_Err RenderChat(PF_InData* in_data, PF_EffectWorld* input, PF_EffectWor
 			chitchat::MeasuredBubble mb;
 			mb.id = item.msg.id;
 			mb.sender = item.msg.sender;
-			if (!g_renderer.Measure(style, item.msg.text, max_bubble, &mb)) {
+			if (!g_renderer.Measure(style, item.msg.sender, item.msg.text, max_bubble, &mb)) {
+				const float pady = chitchat::BubbleInnerPadY(style, item.msg.sender);
 				mb.width = (std::min)(max_bubble, 120.0f * ds);
-				mb.height = (style.font_size + style.padding * 2.0f);
+				mb.height = (style.font_size + pady * 2.0f);
 				mb.text = item.msg.text;
 			}
 			layout.bubbles.push_back(mb);
@@ -641,10 +905,13 @@ static PF_Err SmartPreRender(PF_InData* in_data, PF_OutData* /*out_data*/, PF_Pr
 		chitchat::ClearArb(&pack->messages);
 		AEGP_SuiteHandler suites(in_data->pica_basicP);
 		if (LoadMessageBlock(in_data, &suites, &pack->messages) && pack->messages.count > 0) {
+			pack->custom_font[0] = '\0';
+			LoadCustomFontName(in_data, &suites, pack->custom_font);
 			extra->output->pre_render_data = pack;
 			extra->output->delete_pre_render_data_func = DeletePreRenderPack;
 			if (extra->cb->GuidMixInPtr) {
 				extra->cb->GuidMixInPtr(in_data->effect_ref, static_cast<A_u_long>(sizeof(pack->messages)), &pack->messages);
+				extra->cb->GuidMixInPtr(in_data->effect_ref, static_cast<A_u_long>(sizeof(pack->custom_font)), pack->custom_font);
 			}
 		} else {
 			delete pack;
@@ -660,9 +927,9 @@ static PF_Err SmartRender(PF_InData* in_data, PF_OutData* /*out_data*/, PF_Smart
 	PF_EffectWorld* output = nullptr;
 	ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, CHITCHAT_INPUT, &input));
 	ERR(extra->cb->checkout_output(in_data->effect_ref, &output));
-	const chitchat::ArbBlock* pre = nullptr;
+	const PreRenderPack* pre = nullptr;
 	if (extra->input && extra->input->pre_render_data) {
-		pre = &static_cast<const PreRenderPack*>(extra->input->pre_render_data)->messages;
+		pre = static_cast<const PreRenderPack*>(extra->input->pre_render_data);
 	}
 	if (!err) {
 		err = RenderChat(in_data, input, output, pre);

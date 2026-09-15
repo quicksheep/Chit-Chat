@@ -14,6 +14,7 @@
 #include <Windows.h>
 #include <d2d1.h>
 #include <dwrite.h>
+#include <dwrite_1.h>
 #include <wincodec.h>
 #include <wrl/client.h>
 
@@ -43,6 +44,47 @@ D2D1_COLOR_F Color(float r, float g, float b, float a) {
 	c.b = b;
 	c.a = a;
 	return c;
+}
+
+std::wstring ResolveFontFamily(const StyleSettings& style) {
+	if (style.custom_font[0] && (style.font_index >= kFontPresetCount || style.font_index < 0)) {
+		std::wstring wide;
+		if (Utf8ToWide(style.custom_font, &wide) && !wide.empty()) {
+			return wide;
+		}
+	}
+	const int n = kFontPresetCount;
+	int idx = style.font_index;
+	if (idx < 0 || idx >= n) {
+		idx = 0;
+	}
+	return kFontNames[idx];
+}
+
+void ApplyTextLayoutStyle(IDWriteTextLayout* layout, const StyleSettings& style) {
+	if (!layout) {
+		return;
+	}
+	const float font_size = std::max(4.0f, style.font_size);
+	float line_height = style.line_height;
+	if (line_height < 0.5f) {
+		line_height = 0.5f;
+	}
+	if (line_height > 4.0f) {
+		line_height = 4.0f;
+	}
+	const float line_px = font_size * line_height;
+	layout->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, line_px, line_px * 0.8f);
+
+	if (std::fabs(style.letter_spacing) > 0.001f) {
+		ComPtr<IDWriteTextLayout1> layout1;
+		if (SUCCEEDED(layout->QueryInterface(__uuidof(IDWriteTextLayout1), reinterpret_cast<void**>(layout1.GetAddressOf())))) {
+			DWRITE_TEXT_RANGE range;
+			range.startPosition = 0;
+			range.length = UINT32_MAX;
+			layout1->SetCharacterSpacing(style.letter_spacing * 0.5f, style.letter_spacing * 0.5f, 0.0f, range);
+		}
+	}
 }
 
 HRESULT MakeRoundRectGeometry(ID2D1Factory* factory, const D2D1_RECT_F& rect, float radius, ID2D1RoundedRectangleGeometry** geo) {
@@ -148,7 +190,7 @@ const wchar_t* ChatRenderer::FontFamily(int font_index) const {
 	return kFontNames[font_index];
 }
 
-bool ChatRenderer::Measure(const StyleSettings& style, const std::string& utf8_text, float max_bubble_width, MeasuredBubble* out) {
+bool ChatRenderer::Measure(const StyleSettings& style, Sender sender, const std::string& utf8_text, float max_bubble_width, MeasuredBubble* out) {
 	if (!out || !Init()) {
 		return false;
 	}
@@ -157,15 +199,17 @@ bool ChatRenderer::Measure(const StyleSettings& style, const std::string& utf8_t
 		return false;
 	}
 
-	const float pad = std::max(0.0f, style.padding);
-	const float max_w = std::max(pad * 2.0f + 8.0f, max_bubble_width);
-	const float inner = std::max(8.0f, max_w - pad * 2.0f);
+	const float padx = BubbleInnerPadX(style, sender);
+	const float pady = BubbleInnerPadY(style, sender);
+	const float max_w = std::max(padx * 2.0f + 8.0f, max_bubble_width);
+	const float inner = std::max(8.0f, max_w - padx * 2.0f);
 	const float font_size = std::max(4.0f, style.font_size);
 	const DWRITE_FONT_WEIGHT weight = style.bold ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_REGULAR;
 
 	ComPtr<IDWriteTextFormat> format;
+	const std::wstring family = ResolveFontFamily(style);
 	HRESULT hr = impl_->dwrite->CreateTextFormat(
-		FontFamily(style.font_index),
+		family.c_str(),
 		nullptr,
 		weight,
 		DWRITE_FONT_STYLE_NORMAL,
@@ -189,6 +233,7 @@ bool ChatRenderer::Measure(const StyleSettings& style, const std::string& utf8_t
 	if (FAILED(hr)) {
 		return false;
 	}
+	ApplyTextLayoutStyle(layout.Get(), style);
 
 	DWRITE_TEXT_METRICS metrics{};
 	hr = layout->GetMetrics(&metrics);
@@ -198,8 +243,8 @@ bool ChatRenderer::Measure(const StyleSettings& style, const std::string& utf8_t
 
 	const float text_w = std::max(1.0f, metrics.widthIncludingTrailingWhitespace);
 	const float text_h = std::max(font_size, metrics.height);
-	out->width = std::min(max_w, text_w + pad * 2.0f);
-	out->height = text_h + pad * 2.0f;
+	out->width = std::min(max_w, text_w + padx * 2.0f);
+	out->height = text_h + pady * 2.0f;
 	out->text = utf8_text;
 	return true;
 }
@@ -242,12 +287,12 @@ bool ChatRenderer::Render(const StyleSettings& style, const std::vector<DrawBubb
 	rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 	rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 
-	const float pad = std::max(0.0f, style.padding);
 	const float font_size = std::max(4.0f, style.font_size);
 	const DWRITE_FONT_WEIGHT weight = style.bold ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_REGULAR;
 
 	ComPtr<IDWriteTextFormat> format;
-	hr = impl_->dwrite->CreateTextFormat(FontFamily(style.font_index), nullptr, weight, DWRITE_FONT_STYLE_NORMAL,
+	const std::wstring family = ResolveFontFamily(style);
+	hr = impl_->dwrite->CreateTextFormat(family.c_str(), nullptr, weight, DWRITE_FONT_STYLE_NORMAL,
 										 DWRITE_FONT_STRETCH_NORMAL, font_size, L"en-us", &format);
 	if (FAILED(hr)) {
 		hr = impl_->dwrite->CreateTextFormat(L"Segoe UI", nullptr, weight, DWRITE_FONT_STYLE_NORMAL,
@@ -276,34 +321,94 @@ bool ChatRenderer::Render(const StyleSettings& style, const std::vector<DrawBubb
 		}
 
 		const bool them = (b.sender == Sender::Them);
-		const float br = them ? style.them_bubble_r : style.you_bubble_r;
-		const float bg = them ? style.them_bubble_g : style.you_bubble_g;
-		const float bb = them ? style.them_bubble_b : style.you_bubble_b;
-		const float ba = (them ? style.them_bubble_a : style.you_bubble_a) * b.opacity;
+		const float op = b.opacity;
+		const float top_r = them ? style.them_bubble_top_r : style.you_bubble_top_r;
+		const float top_g = them ? style.them_bubble_top_g : style.you_bubble_top_g;
+		const float top_b = them ? style.them_bubble_top_b : style.you_bubble_top_b;
+		float top_a = them ? style.them_bubble_top_a : style.you_bubble_top_a;
+		const float bot_r = them ? style.them_bubble_bot_r : style.you_bubble_bot_r;
+		const float bot_g = them ? style.them_bubble_bot_g : style.you_bubble_bot_g;
+		const float bot_b = them ? style.them_bubble_bot_b : style.you_bubble_bot_b;
+		float bot_a = them ? style.them_bubble_bot_a : style.you_bubble_bot_a;
 		const float tr = them ? style.them_text_r : style.you_text_r;
 		const float tg = them ? style.them_text_g : style.you_text_g;
 		const float tb = them ? style.them_text_b : style.you_text_b;
-		const float ta = (them ? style.them_text_a : style.you_text_a) * b.opacity;
+		float ta = them ? style.them_text_a : style.you_text_a;
+		float stroke_a = them ? style.them_stroke_a : style.you_stroke_a;
+		const float stroke_w = SenderStrokeWidth(style, b.sender);
+		const float padx = BubbleInnerPadX(style, b.sender);
+		const float pady = BubbleInnerPadY(style, b.sender);
 
-		ComPtr<ID2D1SolidColorBrush> fill;
-		if (FAILED(rt->CreateSolidColorBrush(Color(br, bg, bb, ba), &fill))) {
+		ComPtr<ID2D1Layer> fade_layer;
+		bool pushed_fade = false;
+		if (op < 0.999f) {
+			if (SUCCEEDED(rt->CreateLayer(nullptr, &fade_layer))) {
+				rt->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+													 D2D1::IdentityMatrix(), op, nullptr, D2D1_LAYER_OPTIONS_NONE),
+							  fade_layer.Get());
+				pushed_fade = true;
+			} else {
+				top_a *= op;
+				bot_a *= op;
+				ta *= op;
+				stroke_a *= op;
+			}
+		}
+
+		D2D1_GRADIENT_STOP stops[2];
+		stops[0].position = 0.0f;
+		stops[0].color = Color(top_r, top_g, top_b, top_a);
+		stops[1].position = 1.0f;
+		stops[1].color = Color(bot_r, bot_g, bot_b, bot_a);
+		ComPtr<ID2D1GradientStopCollection> stops_col;
+		if (FAILED(rt->CreateGradientStopCollection(stops, 2, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP, &stops_col))) {
+			if (pushed_fade) {
+				rt->PopLayer();
+			}
+			continue;
+		}
+		const D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES grad_props = D2D1::LinearGradientBrushProperties(
+			D2D1::Point2F(rect.left, rect.top),
+			D2D1::Point2F(rect.left, rect.bottom));
+		ComPtr<ID2D1LinearGradientBrush> fill;
+		if (FAILED(rt->CreateLinearGradientBrush(grad_props, stops_col.Get(), &fill))) {
+			if (pushed_fade) {
+				rt->PopLayer();
+			}
 			continue;
 		}
 		rt->FillGeometry(geo.Get(), fill.Get());
 
+		if (stroke_w > 0.0f) {
+			const float sr = them ? style.them_stroke_r : style.you_stroke_r;
+			const float sg = them ? style.them_stroke_g : style.you_stroke_g;
+			const float sb = them ? style.them_stroke_b : style.you_stroke_b;
+			const float sa = stroke_a;
+			ComPtr<ID2D1SolidColorBrush> stroke;
+			if (SUCCEEDED(rt->CreateSolidColorBrush(Color(sr, sg, sb, sa), &stroke))) {
+				rt->DrawGeometry(geo.Get(), stroke.Get(), stroke_w);
+			}
+		}
+
 		std::wstring wide;
-		if (!Utf8ToWide(b.text, &wide) || wide.empty()) {
-			continue;
+		if (Utf8ToWide(b.text, &wide) && !wide.empty()) {
+			ComPtr<ID2D1SolidColorBrush> text_brush;
+			if (SUCCEEDED(rt->CreateSolidColorBrush(Color(tr, tg, tb, ta), &text_brush))) {
+				const float inner_w = std::max(8.0f, b.width - padx * 2.0f);
+				const float inner_h = std::max(8.0f, b.height - pady * 2.0f);
+				ComPtr<IDWriteTextLayout> text_layout;
+				if (SUCCEEDED(impl_->dwrite->CreateTextLayout(wide.c_str(), static_cast<UINT32>(wide.size()), format.Get(),
+															  inner_w, inner_h, &text_layout))) {
+					ApplyTextLayoutStyle(text_layout.Get(), style);
+					rt->DrawTextLayout(D2D1::Point2F(b.x + padx, b.y + pady), text_layout.Get(), text_brush.Get(),
+									   D2D1_DRAW_TEXT_OPTIONS_CLIP);
+				}
+			}
 		}
 
-		ComPtr<ID2D1SolidColorBrush> text_brush;
-		if (FAILED(rt->CreateSolidColorBrush(Color(tr, tg, tb, ta), &text_brush))) {
-			continue;
+		if (pushed_fade) {
+			rt->PopLayer();
 		}
-
-		const D2D1_RECT_F text_rect = D2D1::RectF(b.x + pad, b.y + pad, b.x + b.width - pad, b.y + b.height - pad);
-		rt->DrawText(wide.c_str(), static_cast<UINT32>(wide.size()), format.Get(), text_rect, text_brush.Get(),
-					 D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
 	}
 
 	hr = rt->EndDraw();
